@@ -1,103 +1,71 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const crypto = require('crypto');
-
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+const TOKEN = process.env.BRIDGE_TOKEN || 'mt5-bridge-secure-token';
+const PORT = process.env.PORT || 8080;
+let ea = { connected: false, lastHb: 0, hb: null };
+let cmdQueue = {};
+let calCache = { ts: 0, data: null };
 
-const PORT = process.env.PORT || 10000;
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || 'mt5-bridge-secure-token';
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type,X-Login,X-Ts,X-Sig,X-Bridge-Token');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-let commandQueue = [];
-let livePrices = {};
+app.get('/', (req, res) => res.json({ ok: true, service: 'huzafx-bridge', routes: ['GET /health', 'POST /ea/sync', 'POST /app/sync', 'GET /app/state', 'GET /tools/calendar'] }));
 
-// helper: pull token from query, header, or body
-function getToken(req) {
-  const auth = (req.headers.authorization || '').split(' ')[1];
-  return req.query.token || auth || req.headers['x-api-key'] || (req.body && req.body.token) || null;
-}
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  ea_connected: ea.connected && (Date.now() - ea.lastHb < 15000),
+  last_ea_hb: ea.lastHb,
+  uptime: process.uptime(),
+  version: '1.0',
+  routes: ['GET /health', 'POST /ea/sync', 'POST /app/sync', 'GET /app/state', 'GET /tools/calendar']
+}));
 
-// helper: reject ONLY if a token was supplied and it's wrong; allow if none supplied
-function authOk(req) {
-  const t = getToken(req);
-  if (t === null) return true;            // no token -> accept (private bridge)
-  return t === BRIDGE_TOKEN;              // wrong token -> reject
-}
+app.post('/ea/sync', (req, res) => {
+  const login = String(req.headers['x-login'] || (req.body && req.body.login) || '0');
+  const evs = (req.body && req.body.events) || [];
+  for (const e of evs) { if (e && e.t === 'HEARTBEAT') { ea.lastHb = Date.now(); ea.hb = e; ea.connected = true; } }
+  const q = cmdQueue[login] || []; cmdQueue[login] = [];
+  const lines = q.map(c => c.id + '|' + c.cmd + '|' + (c.params || ''));
+  res.type('text/plain').send('\n' + lines.join('\n') + '\n');
+});
 
-// --- Health / legacy ---
-app.get('/', (req, res) => res.json({ status: 'Huzafx Relay Online', message: 'Server is running' }));
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
-app.get('/api/command', (req, res) => res.json({ status: 'idle' }));
-app.get('/api/commands', (req, res) => res.json({ status: 'idle' }));
-
-// --- Telemetry WRITE (from EA) ---
-app.post('/api/mt5/telemetry', (req, res) => {
-  if (!authOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-  const { symbols, symbol, equity, balance, login, time } = req.body || {};
-  if (symbols && typeof symbols === 'object') {
-    for (const [sym, d] of Object.entries(symbols))
-      livePrices[sym] = { ...d, equity, balance, login, time, ts: Date.now() };
-  } else if (symbol) {
-    livePrices[symbol] = { ...req.body, ts: Date.now() };
+app.post('/app/sync', (req, res) => {
+  if ((req.headers['x-bridge-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad token' });
+  const b = req.body || {};
+  if (b.action === 'state') return res.json({ ok: true, ea_connected: (Date.now() - ea.lastHb < 15000), last_ea_hb: ea.lastHb, heartbeat: ea.hb });
+  if (b.action === 'command') {
+    const login = String(b.login || '0');
+    (cmdQueue[login] = cmdQueue[login] || []).push({ id: b.id, cmd: b.cmd, params: b.params || '' });
+    return res.json({ queued: true });
   }
-  res.status(200).send('OK');
+  res.status(400).json({ error: 'unknown action' });
 });
 
-// --- Telemetry READ (from app) ---
-app.get('/api/mt5/telemetry', (req, res) => {
-  if (!authOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-  res.json(livePrices);
+app.get('/app/state', (req, res) => {
+  if ((req.headers['x-bridge-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad token' });
+  res.json({ ok: true, ea_connected: (Date.now() - ea.lastHb < 15000), last_ea_hb: ea.lastHb, heartbeat: ea.hb });
 });
 
-// --- EA POLLS commands ---
-app.get('/api/mt5/commands', (req, res) => {
-  if (!authOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-  if (commandQueue.length > 0) {
-    const cmd = commandQueue.shift();
-    console.log('Sending command to EA:', cmd);
-    return res.json(cmd);
-  }
-  res.json({ status: 'idle' });
+app.get('/tools/calendar', (req, res) => {
+  const now = Date.now();
+  if (calCache.data && now - calCache.ts < 900000) return res.json(calCache.data);
+  fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json')
+    .then(r => r.json())
+    .then(raw => {
+      const events = (raw || []).map(e => ({
+        time_utc: e.date, currency: e.country, event: e.title,
+        impact: e.impact, consensus: e.forecast || '', previous: e.previous || '', actual: e.actual || ''
+      }));
+      calCache = { ts: now, data: { ok: true, source: 'faireconomy-server-side', events } };
+      res.json(calCache.data);
+    })
+    .catch(() => res.status(503).json({ ok: false, error: 'calendar upstream failed' }));
 });
 
-// --- APP SUBMITS orders (THE FIXED ROUTE) ---
-app.post('/api/mt5/commands', (req, res) => {
-  if (!authOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-
-  const { symbol, type, lots, sl, tp, price } = req.body || {};
-  if (!symbol || !type) return res.status(400).json({ error: 'missing symbol/type' });
-
-  const t = String(type).toLowerCase().replace(/\s+/g, '_');
-  const valid = ['buy', 'sell', 'buy_limit', 'sell_limit', 'buy_stop', 'sell_stop'];
-  if (!valid.includes(t))
-    return res.status(400).json({ error: 'type must be buy, sell, buy_limit, sell_limit, buy_stop, or sell_stop' });
-  if (!(Number(lots) > 0)) return res.status(400).json({ error: 'invalid lots' });
-
-  const cmd = {
-    id: crypto.randomUUID(),
-    symbol: String(symbol),
-    type: t,
-    lots: Number(lots),
-    sl: Number(sl) || 0,
-    tp: Number(tp) || 0,
-    price: price ? Number(price) : 0
-  };
-  commandQueue.push(cmd);
-  console.log('Order queued:', cmd);
-  res.json({ success: true, queued: commandQueue.length, id: cmd.id });
-});
-
-// --- News proxy ---
-app.get('/api/news-iq', async (req, res) => {
-  try {
-    const r = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.json', { timeout: 8000 });
-    res.json(r.data.filter(e => /high|red/i.test(e.impact || '')));
-  } catch (e) {
-    res.status(200).json({ demo: true, events: [], error: 'News fetch failed' });
-  }
-});
-
-app.listen(PORT, () => console.log(`[Huzafx AI] Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log('HUZAFX relay listening on', PORT));
